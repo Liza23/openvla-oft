@@ -16,6 +16,7 @@ import timm
 import tokenizers
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
@@ -458,6 +459,97 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
         return projected_patch_embeddings
 
+    def _resize_images_for_backbone(self, imgs: torch.Tensor) -> torch.Tensor:
+        """Resize images to match the vision backbone resolution if needed."""
+        if not hasattr(self, "config") or not hasattr(self.config, "image_sizes"):
+            return imgs
+        target_size = self.config.image_sizes[0]
+        if imgs.shape[-2:] != (target_size, target_size):
+            imgs = F.interpolate(imgs, size=(target_size, target_size), mode="bilinear", align_corners=False)
+        return imgs
+
+    def _encode_predicted_images(self, imgs: torch.Tensor, freeze_encoder: bool = True) -> torch.Tensor:
+        """Encode predicted images into projected patch embeddings.
+
+        Args:
+            imgs: Tensor of shape [B, N, C, H, W] or [B, C, H, W]
+            freeze_encoder: If True, do not backprop through vision backbone/projector.
+        Returns:
+            projected_patch_embeddings: Tensor of shape [B, P, D]
+        """
+        if imgs.dim() == 5:
+            B, N, C, H, W = imgs.shape
+            imgs_flat = imgs.view(B * N, C, H, W)
+        else:
+            B = imgs.shape[0]
+            N = 1
+            imgs_flat = imgs
+
+        imgs_flat = self._resize_images_for_backbone(imgs_flat)
+
+        if freeze_encoder:
+            with torch.no_grad():
+                patch_feats = self.vision_backbone(imgs_flat)
+                proj = self.projector(patch_feats)
+        else:
+            patch_feats = self.vision_backbone(imgs_flat)
+            proj = self.projector(patch_feats)
+
+        if N > 1:
+            proj = proj.view(B, N, proj.shape[1], proj.shape[2]).mean(dim=1)
+        return proj
+
+    def _maybe_fuse_predicted_intermediates(self, projected_patch_embeddings, language_embeddings):
+        """Optionally predict intermediate latents/images and fuse into patch embeddings."""
+        mode = getattr(self, "intermediate_prediction_mode", "none")
+        predictor = getattr(self, "latent_predictor", None)
+        if mode == "none" or predictor is None:
+            self._last_predicted_latents = None
+            self._last_predicted_imgs = None
+            return projected_patch_embeddings
+
+        steps = int(getattr(self, "latent_predict_steps", 1))
+        steps = max(steps, 1)
+
+        mean_patches = projected_patch_embeddings.mean(dim=1)
+        mean_text = language_embeddings.mean(dim=1)
+        context = torch.cat([mean_patches, mean_text], dim=-1)
+
+        predicted_latents = []
+        predicted_imgs = []
+
+        for _step in range(steps):
+            pred_latent, pred_latent_llm = predictor(context)
+            predicted_latents.append(pred_latent)
+
+            if mode in ("pixel", "flow") and getattr(self, "image_decoder", None) is not None:
+                pred_img = self.image_decoder(pred_latent)
+                predicted_imgs.append(pred_img)
+
+            mean_text = mean_text + pred_latent_llm
+            context = torch.cat([mean_patches, mean_text], dim=-1)
+
+        # Fuse predicted latents into patch embeddings
+        llm_add = None
+        for pl in predicted_latents:
+            pl_llm = predictor.to_llm(pl)
+            llm_add = pl_llm if llm_add is None else llm_add + pl_llm
+        if llm_add is not None:
+            projected_patch_embeddings = projected_patch_embeddings + llm_add.unsqueeze(1)
+
+        # If images predicted, encode and fuse
+        if len(predicted_imgs) > 0:
+            imgs_stack = torch.stack(predicted_imgs, dim=1)  # [B, N, C, H, W]
+            freeze_encoder = bool(getattr(self, "freeze_pred_image_encoder", True))
+            img_proj_mean = self._encode_predicted_images(imgs_stack, freeze_encoder=freeze_encoder)
+            projected_patch_embeddings = projected_patch_embeddings + img_proj_mean
+            self._last_predicted_imgs = imgs_stack
+        else:
+            self._last_predicted_imgs = None
+
+        self._last_predicted_latents = torch.stack(predicted_latents, dim=1)
+        return projected_patch_embeddings
+
     def _build_multimodal_attention(self, input_embeddings, projected_patch_embeddings, attention_mask):
         """Build multimodal embeddings and attention mask"""
         # Update attention mask
@@ -588,6 +680,11 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
+            )
+
+            # Optionally predict intermediate latents/images and fuse into patch embeddings
+            projected_patch_embeddings = self._maybe_fuse_predicted_intermediates(
+                projected_patch_embeddings, language_embeddings
             )
 
             # [Diffusion] Add diffusion timestep embedding if provided
@@ -1009,6 +1106,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
             )
+
+        # Optionally predict intermediate latents/images and fuse into patch embeddings
+        projected_patch_embeddings = self._maybe_fuse_predicted_intermediates(
+            projected_patch_embeddings, language_embeddings
+        )
 
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")

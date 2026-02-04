@@ -38,6 +38,7 @@ dependencies = [
     "json-numpy",
     "jsonlines",
     "matplotlib",
+    "numpy<2",
     "peft==0.11.1",
     "protobuf",
     "rich",

@@ -153,4 +153,16 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+
+        # Optional future frames for prediction supervision (e.g., T+1..T+N)
+        if "future_pixel_values" in instances[0]:
+            fut_pvs = [instance["future_pixel_values"] for instance in instances]
+            # Could be Tensor [N, C, H, W] or a list/ndarray
+            if isinstance(fut_pvs[0], torch.Tensor):
+                # Stack into [B, N, C, H, W] or [B, C, H, W]
+                output["future_pixel_values"] = torch.stack(fut_pvs)
+            else:
+                # Try convert from numpy arrays
+                output["future_pixel_values"] = torch.stack([torch.Tensor(x) for x in fut_pvs])
+
         return output

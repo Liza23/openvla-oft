@@ -5,6 +5,11 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
+
+# Disable flash-attn to avoid compilation issues with incompatible environments
+os.environ["FLASH_ATTENTION_2_SKIP_INIT"] = "1"
+os.environ["TRANSFORMERS_NO_FLASH_ATTN_2"] = "1"
+
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -15,6 +20,7 @@ import draccus
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import tqdm
 from accelerate import PartialState
 from huggingface_hub import HfApi, snapshot_download
@@ -71,6 +77,7 @@ class FinetuneConfig:
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
     # Dataset
+    dataset_source: str = "rlds"                     # Dataset source: "rlds" or "lerobot"
     data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
     dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
@@ -83,6 +90,16 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+
+    # Intermediate prediction (images before actions)
+    intermediate_prediction: str = "none"            # "none" | "latent" | "pixel" | "flow"
+    intermediate_prediction_steps: int = 3           # N steps (T+1..T+N)
+    intermediate_latent_dim: int = 256               # Latent size for Option A/B/C
+    intermediate_image_res: int = 64                 # Decoder output resolution for Option B/C
+    intermediate_freeze_image_encoder: bool = True   # Freeze vision backbone when encoding predicted images
+    intermediate_latent_loss_weight: float = 0.1     # Option A loss weight
+    intermediate_image_loss_weight: float = 0.05     # Option B loss weight
+    intermediate_flow_loss_weight: float = 0.05      # Option C loss weight
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -111,8 +128,8 @@ class FinetuneConfig:
                                                      #         False and merge final checkpoint offline!
 
     # Logging
-    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
-    wandb_project: str = "your-wandb-project"        # Name of WandB project
+    wandb_entity: str = "ldahiya-carnegie-mellon-university"          # Name of WandB entity
+    wandb_project: str = "openvla"        # Name of WandB project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
@@ -143,6 +160,44 @@ def remove_ddp_in_checkpoint(state_dict) -> dict:
         else:
             new_state_dict[k] = v
     return new_state_dict
+
+
+def safe_dist_barrier() -> None:
+    """
+    Safely call torch.distributed.barrier() only if distributed training is initialized.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def get_module(module) -> nn.Module:
+    """
+    Get the underlying module, handling both DDP-wrapped and non-wrapped cases.
+    
+    Args:
+        module: A module that may or may not be wrapped with DDP.
+    
+    Returns:
+        The underlying module (unwrapped if it's DDP-wrapped).
+    """
+    if isinstance(module, DDP):
+        return module.module
+    return module
+
+
+def get_base_model(module) -> nn.Module:
+    """
+    Unwrap DDP/PEFT to return the underlying base model (OpenVLAForActionPrediction).
+    """
+    module = get_module(module)
+    if hasattr(module, "get_base_model"):
+        try:
+            return module.get_base_model()
+        except Exception:
+            pass
+    if hasattr(module, "base_model"):
+        return module.base_model
+    return module
 
 
 def get_run_id(cfg) -> str:
@@ -198,9 +253,9 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     return remove_ddp_in_checkpoint(state_dict)
 
 
-def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
+def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False):
     """
-    Wrap a module with DistributedDataParallel.
+    Wrap a module with DistributedDataParallel if in a distributed setting.
 
     Args:
         module (nn.Module): PyTorch module.
@@ -208,9 +263,14 @@ def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DD
         find_unused (bool): Whether to detect parameters without gradients in distributed training.
 
     Returns:
-        DistributedDataParallel: PyTorch module wrapped with DDP.
+        DDP-wrapped module if distributed, otherwise the original module.
     """
-    return DDP(module, device_ids=[device_id], find_unused_parameters=find_unused, gradient_as_bucket_view=True)
+    # Only wrap with DDP if distributed training is initialized
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return DDP(module, device_ids=[device_id], find_unused_parameters=find_unused, gradient_as_bucket_view=True)
+    else:
+        # Single GPU training: don't wrap with DDP
+        return module
 
 
 def count_parameters(module: nn.Module, name: str) -> None:
@@ -236,9 +296,9 @@ def init_module(
     module_args: dict,
     to_bf16: bool = False,
     find_unused_params: bool = False,
-) -> DDP:
+):
     """
-    Initializes a module, optionally loads checkpoint, moves to device, and wraps with DDP.
+    Initializes a module, optionally loads checkpoint, moves to device, and wraps with DDP if distributed.
 
     Args:
         module_class (Type[nn.Module]): Class of PyTorch module to initialize.
@@ -250,7 +310,7 @@ def init_module(
         find_unused_params (bool): Whether to detect parameters without gradients in distributed training.
 
     Returns:
-        DistributedDataParallel: PyTorch module wrapped with DDP.
+        Module (optionally wrapped with DDP).
     """
     module = module_class(**module_args)
     count_parameters(module, module_name)
@@ -314,7 +374,8 @@ def run_forward_pass(
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network
     if use_diffusion:
-        noisy_dict = action_head.module.sample_noisy_actions(ground_truth_actions)
+        action_head_module = get_module(action_head)
+        noisy_dict = action_head_module.sample_noisy_actions(ground_truth_actions)
         noise, noisy_actions, diffusion_timestep_embeddings = (
             noisy_dict["noise"],
             noisy_dict["noisy_actions"],
@@ -329,7 +390,7 @@ def run_forward_pass(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
             pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-            labels=batch["labels"],
+            labels=batch["labels"].to(device_id),
             output_hidden_states=True,
             proprio=batch["proprio"] if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
@@ -340,7 +401,7 @@ def run_forward_pass(
         )
 
     # Get action masks needed for logging
-    ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
+    ground_truth_token_ids = batch["labels"].to(device_id)[:, 1:]
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
@@ -385,13 +446,15 @@ def run_forward_pass(
 
         if use_l1_regression:
             # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            action_head_module = get_module(action_head)
+            predicted_actions = action_head_module.predict_action(actions_hidden_states)
             # Get full L1 loss
             loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
         if use_diffusion:
             # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            action_head_module = get_module(action_head)
+            noise_pred = action_head_module.predict_noise(actions_hidden_states)
             # Get diffusion noise prediction MSE loss
             noise_pred = noise_pred.reshape(noise.shape)
             loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
@@ -420,6 +483,71 @@ def run_forward_pass(
                 "loss_value": loss.item(),  # Detached value for logging
             }
         )
+
+        # === Intermediate prediction losses (Options A/B/C) ===
+        mode = getattr(vla, "intermediate_prediction_mode", "none")
+        if mode != "none" and "future_pixel_values" in batch:
+            vla_module = get_base_model(vla)
+            pred_latents = getattr(vla_module, "_last_predicted_latents", None)
+            pred_imgs = getattr(vla_module, "_last_predicted_imgs", None)
+
+            future_pixel_values = batch["future_pixel_values"].to(torch.bfloat16).to(device_id)
+            if future_pixel_values.dim() == 4:
+                future_pixel_values = future_pixel_values.unsqueeze(1)
+
+            if mode == "latent" and pred_latents is not None:
+                try:
+                    fut = future_pixel_values[:, : pred_latents.shape[1]]
+                    B, N, C, H, W = fut.shape
+                    fut_flat = fut.reshape(B * N, C, H, W)
+                    fut_flat = vla_module._resize_images_for_backbone(fut_flat)
+                    with torch.no_grad():
+                        fut_patch_features = vla_module.vision_backbone(fut_flat)
+                        fut_projected = vla_module.projector(fut_patch_features)
+                        target_latents = vla_module.latent_predictor.encode_target_from_patches(fut_projected)
+                    target_latents = target_latents.view(B, N, -1)
+                    latent_loss = nn.functional.mse_loss(pred_latents, target_latents)
+                    loss = loss + cfg.intermediate_latent_loss_weight * latent_loss
+                    metrics.update({"latent_pred_loss": latent_loss.item()})
+                except Exception:
+                    pass
+
+            if mode == "pixel" and pred_imgs is not None:
+                try:
+                    fut = future_pixel_values[:, : pred_imgs.shape[1]]
+                    if fut.shape[-2:] != pred_imgs.shape[-2:]:
+                        B, N, C, H, W = fut.shape
+                        fut = F.interpolate(
+                            fut.reshape(B * N, C, H, W),
+                            size=pred_imgs.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        ).view(B, N, C, pred_imgs.shape[-2], pred_imgs.shape[-1])
+                    img_loss = nn.functional.mse_loss(pred_imgs, fut)
+                    loss = loss + cfg.intermediate_image_loss_weight * img_loss
+                    metrics.update({"image_pred_loss": img_loss.item()})
+                except Exception:
+                    pass
+
+            if mode == "flow" and pred_imgs is not None and vla_module.flow_matcher is not None:
+                try:
+                    fut = future_pixel_values[:, : pred_imgs.shape[1]]
+                    if fut.shape[-2:] != pred_imgs.shape[-2:]:
+                        B, N, C, H, W = fut.shape
+                        fut = F.interpolate(
+                            fut.reshape(B * N, C, H, W),
+                            size=pred_imgs.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        ).view(B, N, C, pred_imgs.shape[-2], pred_imgs.shape[-1])
+                    flow_loss = vla_module.flow_matcher.compute_loss(pred_imgs, fut)
+                    loss = loss + cfg.intermediate_flow_loss_weight * flow_loss
+                    metrics.update({"flow_pred_loss": flow_loss.item()})
+                except Exception:
+                    pass
+
+        # Update loss metric after any auxiliary losses
+        metrics["loss_value"] = loss.item()
 
         # Get detailed L1 losses for logging
         should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
@@ -485,16 +613,17 @@ def run_diffusion_sampling(
     )  # (B, chunk_len, action_dim)
 
     # Set diffusion timestep values
-    action_head.module.noise_scheduler.set_timesteps(action_head.module.num_diffusion_steps_train)
+    action_head_module = get_module(action_head)
+    action_head_module.noise_scheduler.set_timesteps(action_head_module.num_diffusion_steps_train)
 
     # Reverse diffusion: Iteratively denoise to generate action, conditioned on observation
     curr_noisy_actions = noise
-    for t in action_head.module.noise_scheduler.timesteps:
+    for t in action_head_module.noise_scheduler.timesteps:
         # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action embedding,
         # and diffusion timestep embedding)
         timesteps = torch.Tensor([t]).repeat(batch_size).to(device_id)
         diffusion_timestep_embeddings = (
-            action_head.module.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
+            action_head_module.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
         )  # (B, llm_dim)
         diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
 
@@ -503,7 +632,7 @@ def run_diffusion_sampling(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
                 pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                labels=batch["labels"],
+                labels=batch["labels"].to(device_id),
                 output_hidden_states=True,
                 proprio=batch["proprio"] if use_proprio else None,
                 proprio_projector=proprio_projector if use_proprio else None,
@@ -522,10 +651,11 @@ def run_diffusion_sampling(
             )  # (B, act_chunk_len, D)
             actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
             # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            action_head_module = get_module(action_head)
+            noise_pred = action_head_module.predict_noise(actions_hidden_states)
 
         # Compute the action at the previous diffusion timestep: x_t -> x_{t-1}
-        curr_noisy_actions = action_head.module.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
+        curr_noisy_actions = action_head_module.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
 
     return curr_noisy_actions.reshape(actions_shape)
 
@@ -569,6 +699,28 @@ def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
         else:
             log_dict[f"{prefix}/{name.replace('_', ' ').title()}"] = value
     wandb_entity.log(log_dict, step=step)
+
+
+def _tensor_to_wandb_images(imgs: torch.Tensor, caption_prefix: str, max_frames: int = 3):
+    if imgs is None:
+        return None
+    if imgs.dim() == 4:
+        imgs = imgs.unsqueeze(1)  # [B, 1, C, H, W]
+    if imgs.dim() != 5:
+        return None
+    imgs = imgs[:1]  # first sample
+    imgs = imgs[0][:max_frames]  # [N, C, H, W]
+    imgs = imgs.float().detach().cpu()
+    if imgs.numel() == 0:
+        return None
+    if imgs.min() < 0:
+        imgs = (imgs + 1.0) / 2.0
+    imgs = imgs.clamp(0.0, 1.0)
+    out = []
+    for i, img in enumerate(imgs):
+        img = img.permute(1, 2, 0).numpy()
+        out.append(wandb.Image(img, caption=f"{caption_prefix}_{i}"))
+    return out
 
 
 def save_training_checkpoint(
@@ -619,13 +771,14 @@ def save_training_checkpoint(
         print(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
-    dist.barrier()
+    safe_dist_barrier()
 
     # Save model components (main process only)
     if distributed_state.is_main_process:
         # Save processor and LoRA adapter
         processor.save_pretrained(checkpoint_dir)
-        vla.module.save_pretrained(adapter_dir)
+        vla_module = get_module(vla)
+        vla_module.save_pretrained(adapter_dir)
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
@@ -641,12 +794,13 @@ def save_training_checkpoint(
 
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
+            vla_module = get_module(vla)
             torch.save(
-                vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
+                vla_module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
             )
 
     # Wait for model components to be saved
-    dist.barrier()
+    safe_dist_barrier()
 
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
@@ -662,7 +816,7 @@ def save_training_checkpoint(
             print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
         # Wait for merged model to be saved
-        dist.barrier()
+        safe_dist_barrier()
 
 
 def run_validation(
@@ -770,6 +924,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    assert cfg.intermediate_prediction in {"none", "latent", "pixel", "flow"}, (
+        "intermediate_prediction must be one of: none | latent | pixel | flow"
+    )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -828,7 +985,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         check_model_logic_mismatch(cfg.vla_path)
 
     # Wait for model files to be synced
-    dist.barrier()
+    safe_dist_barrier()
 
     # Load processor and VLA
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
@@ -876,46 +1033,50 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
+        vla_module = get_module(vla)
         proprio_projector = init_module(
             ProprioProjector,
             "proprio_projector",
             cfg,
             device_id,
-            {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            {"llm_dim": vla_module.llm_dim, "proprio_dim": PROPRIO_DIM},
         )
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
+        vla_module = get_module(vla)
         action_head = init_module(
             L1RegressionActionHead,
             "action_head",
             cfg,
             device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            {"input_dim": vla_module.llm_dim, "hidden_dim": vla_module.llm_dim, "action_dim": ACTION_DIM},
             to_bf16=True,
         )
 
     # If applicable, instantiate diffusion action head and noisy action projector
     if cfg.use_diffusion:
+        vla_module = get_module(vla)
         action_head = init_module(
             DiffusionActionHead,
             "action_head",
             cfg,
             device_id,
             {
-                "input_dim": vla.module.llm_dim,
-                "hidden_dim": vla.module.llm_dim,
+                "input_dim": vla_module.llm_dim,
+                "hidden_dim": vla_module.llm_dim,
                 "action_dim": ACTION_DIM,
                 "num_diffusion_steps_train": cfg.num_diffusion_steps_train,
             },
             to_bf16=True,
         )
         noisy_action_projector = init_module(
-            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
+            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla_module.llm_dim}
         )
 
     # Get number of vision patches
-    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    vla_module = get_base_model(vla)
+    NUM_PATCHES = vla_module.vision_backbone.get_num_patches() * vla_module.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -923,6 +1084,35 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_diffusion:
         NUM_PATCHES += 1
 
+    # === Initialize Optional Predictors (Options A/B/C) ===
+    from prismatic.models.vlas.prediction import LatentPredictor, ImageDecoder, FlowMatcher
+
+    vla_module.intermediate_prediction_mode = cfg.intermediate_prediction
+    vla_module.latent_predict_steps = cfg.intermediate_prediction_steps
+    vla_module.freeze_pred_image_encoder = cfg.intermediate_freeze_image_encoder
+
+    context_dim = 2 * vla_module.llm_dim  # mean_patches + mean_text
+    if cfg.intermediate_prediction != "none":
+        vla_module.latent_predictor = LatentPredictor(
+            context_dim=context_dim,
+            latent_dim=cfg.intermediate_latent_dim,
+            llm_embed_dim=vla_module.llm_dim,
+        ).to(device_id)
+    else:
+        vla_module.latent_predictor = None
+
+    if cfg.intermediate_prediction in ("pixel", "flow"):
+        vla_module.image_decoder = ImageDecoder(
+            latent_dim=cfg.intermediate_latent_dim, out_res=cfg.intermediate_image_res
+        ).to(device_id)
+    else:
+        vla_module.image_decoder = None
+
+    if cfg.intermediate_prediction == "flow":
+        vla_module.flow_matcher = FlowMatcher()
+    else:
+        vla_module.flow_matcher = None
+    
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     if cfg.use_l1_regression or cfg.use_diffusion:
@@ -931,6 +1121,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    # Predictor params are already part of vla.parameters() once attached to the module.
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -975,27 +1166,57 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
     )
-    train_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-    )
-    if cfg.use_val_set:
-        val_dataset = RLDSDataset(
+    
+    # === Handle dataset source (RLDS or LeRobot) ===
+    if cfg.dataset_source == "rlds":
+        train_dataset = RLDSDataset(
             cfg.data_root_dir,
             cfg.dataset_name,
             batch_transform,
-            resize_resolution=tuple(vla.module.config.image_sizes),
-            shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
+            resize_resolution=tuple(get_base_model(vla).config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
             image_aug=cfg.image_aug,
-            train=False,
         )
-
-    # [Important] Save dataset statistics so that we can unnormalize actions during inference
-    if distributed_state.is_main_process:
+        if cfg.use_val_set:
+            val_dataset = RLDSDataset(
+                cfg.data_root_dir,
+                cfg.dataset_name,
+                batch_transform,
+                resize_resolution=tuple(vla.module.config.image_sizes),
+                shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
+                image_aug=cfg.image_aug,
+                train=False,
+            )
+    elif cfg.dataset_source == "lerobot":
+        from prismatic.vla.datasets.lerobot_dataset import LeRobotDataset, LeRobotBatchTransform
+        
+        # Create LeRobot-specific batch transform
+        lerobot_transform = LeRobotBatchTransform(
+            action_tokenizer=action_tokenizer,
+            base_tokenizer=processor.tokenizer,
+            image_transform=batch_transform.image_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            predict_stop_token=True,
+            predict_steps=cfg.intermediate_prediction_steps,
+        )
+        train_dataset = LeRobotDataset(
+            dataset_name=cfg.dataset_name,
+            split="train",
+            batch_transform=lerobot_transform,
+            predict_steps=cfg.intermediate_prediction_steps,
+        )
+        if cfg.use_val_set:
+            val_dataset = LeRobotDataset(
+                dataset_name=cfg.dataset_name,
+                split="val",
+                batch_transform=lerobot_transform,
+                predict_steps=cfg.intermediate_prediction_steps,
+            )
+    else:
+        raise ValueError(f"Unknown dataset_source: {cfg.dataset_source}. Use 'rlds' or 'lerobot'.")
+    
+    # [Important] Save dataset statistics (for RLDS only)
+    if distributed_state.is_main_process and cfg.dataset_source == "rlds":
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
 
     # Create collator and dataloader
@@ -1007,7 +1228,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         batch_size=cfg.batch_size,
         sampler=None,
         collate_fn=collator,
-        num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
+        num_workers=0 if cfg.dataset_source == "rlds" else 4,  # RLDS uses its own parallelism; LeRobot can use workers
     )
     if cfg.use_val_set:
         val_batch_size = cfg.batch_size
@@ -1016,7 +1237,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             batch_size=val_batch_size,
             sampler=None,
             collate_fn=collator,
-            num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
+            num_workers=0 if cfg.dataset_source == "rlds" else 4,
         )
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
@@ -1073,6 +1294,23 @@ def finetune(cfg: FinetuneConfig) -> None:
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                if cfg.intermediate_prediction in {"pixel", "flow"}:
+                    vla_module = get_base_model(vla)
+                    pred_imgs = getattr(vla_module, "_last_predicted_imgs", None)
+                    pred_wandb = _tensor_to_wandb_images(
+                        pred_imgs, caption_prefix="pred", max_frames=cfg.intermediate_prediction_steps
+                    )
+                    log_dict = {}
+                    if pred_wandb is not None:
+                        log_dict["VLA Train/Predicted Frames"] = pred_wandb
+                    if "future_pixel_values" in batch and isinstance(batch["future_pixel_values"], torch.Tensor):
+                        tgt_wandb = _tensor_to_wandb_images(
+                            batch["future_pixel_values"], caption_prefix="target", max_frames=cfg.intermediate_prediction_steps
+                        )
+                        if tgt_wandb is not None:
+                            log_dict["VLA Train/Target Frames"] = tgt_wandb
+                    if log_dict:
+                        wandb.log(log_dict, step=log_step)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
